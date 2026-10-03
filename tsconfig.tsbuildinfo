@@ -1,1 +1,1 @@
-{"root":["./src/main.ts","./src/shims.d.ts","./src/store.ts","./src/units.ts","./src/viewer.ts","./src/geometry/clipper.ts","./src/geometry/gear.ts","./src/geometry/mesh.ts","./src/App.vue"],"version":"5.7.3"}
+{"root":["./src/main.ts","./src/shims.d.ts","./src/store.ts","./src/toleranceJob.ts","./src/units.ts","./src/viewer.ts","./src/geometry/clipper.ts","./src/geometry/gear.ts","./src/geometry/mesh.ts","./src/geometry/tolerance.ts","./src/App.vue","./src/TolerancePanel.vue"],"version":"5.7.3"}

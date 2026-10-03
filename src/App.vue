@@ -3,8 +3,10 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
-import { GearViewer, type ViewerOptions } from './viewer'
+import { GearViewer, type ViewerOptions, type TolerancePreview } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
+import TolerancePanel from './TolerancePanel.vue'
+import type { BaselineSnapshot } from './geometry/tolerance'
 import {
   type CaseData,
   downloadJson,
@@ -47,6 +49,19 @@ function rebuild() {
     : gearParams.centerDistance
   mesh.value = analyzeMesh({ g1: g1.value, g2: g2.value, centerDistance: a })
 }
+
+/** 冻结给公差面板的基准快照（内部 mm/度；面板提交时再复制，互不影响） */
+const toleranceBaseline = computed<BaselineSnapshot | null>(() => {
+  if (!g1.value || !g2.value || !mesh.value || errors.g1.length || errors.g2.length) return null
+  return {
+    z1: Math.round(gearParams.z1),
+    z2: Math.round(gearParams.z2),
+    module: gearParams.m,
+    alphaDeg: gearParams.alphaDeg,
+    faceWidth: gearParams.faceWidth,
+    centerDistance: mesh.value.a
+  }
+})
 
 // ------- 单位输入辅助（数值随单位换算；内部 mm 不变） -------
 const mInput = computed({
@@ -105,6 +120,9 @@ async function checkInterference(currentPhi1: number) {
   }
 }
 
+// ------- 公差包络分析预览（冻结快照几何；viewer 内部屏蔽动画驱动） -------
+const tolerancePreview = shallowRef<TolerancePreview | null>(null)
+
 // ------- 视图 -------
 const host = ref<HTMLDivElement>()
 let viewer: GearViewer | null = null
@@ -126,7 +144,7 @@ onMounted(() => {
   const loop = (t: number) => {
     const dt = Math.min(0.05, (t - lastT) / 1000 || 0)
     lastT = t
-    if (playing.value && g1.value && g2.value && mesh.value) {
+    if (playing.value && g1.value && g2.value && mesh.value && !tolerancePreview.value) {
       phi1.value += speed.value * dt
       // 归一到一个齿距周期，避免数值增长
       const period = (2 * Math.PI) / g1.value.input.z
@@ -171,8 +189,24 @@ watch(
     contactS.value = 0
     interferenceArea.value = null
     interferenceRegions.value = []
+    // 基准改变：公差旧快照预览必须退出，旧结果不能留在几何视图中冒充新结果
+    if (tolerancePreview.value) tolerancePreview.value = null
   }
 )
+
+// ------- 公差包络分析预览处理（状态已在视图区声明） -------
+function onTolerancePreview(p: TolerancePreview | null) {
+  tolerancePreview.value = p
+  if (!viewer) return
+  if (p) {
+    viewer.setTolerancePreview(p)
+  } else {
+    // 退出预览：清掉可能残留的单帧干涉高亮，恢复当前基准几何
+    interferenceArea.value = null
+    interferenceRegions.value = []
+    if (g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  }
+}
 
 watch(showOpts, pushOverlay)
 watch(contactS, () => (showOpts.contactS = contactS.value))
@@ -413,6 +447,10 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
 
       <section class="viewport">
         <div ref="host" class="canvas-host"></div>
+        <div v-if="tolerancePreview" class="tol-banner">
+          公差包络预览：显示的是<b>作业快照冻结的基准与最坏相位</b>（红色＝重叠区，黄点＝最坏位置），
+          不是当前参数面板的齿轮。教学近似，非制造认证。
+        </div>
 
         <div class="readouts">
           <div v-if="dims" class="dim-grid">
@@ -456,6 +494,15 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
       </section>
 
       <aside class="panel right">
+        <TolerancePanel
+          v-if="toleranceBaseline"
+          :baseline="toleranceBaseline"
+          :unit="unit"
+          :preview-active="!!tolerancePreview"
+          @preview="onTolerancePreview"
+        />
+        <div v-else class="tol-disabled">基准齿轮参数非法时不能进行公差包络分析。</div>
+
         <section>
           <h2>案例（IndexedDB）</h2>
           <input v-model="caseName" placeholder="案例名称" />

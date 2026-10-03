@@ -9,7 +9,10 @@ import type { GearInput, Pt } from './geometry/gear'
 
 export const SCHEMA_VERSION = 1
 export const DB_NAME = 'spur-gear-lab'
+export const DB_VERSION = 2
 export const STORE = 'cases'
+/** 公差包络分析作业库（v2 新增） */
+export const TOL_STORE = 'tolerance-jobs'
 
 export interface CaseData {
   schemaVersion: number
@@ -32,15 +35,21 @@ export interface CaseData {
 
 let dbPromise: Promise<IDBDatabase> | null = null
 
-function openDb(): Promise<IDBDatabase> {
+export function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: 'id' })
         store.createIndex('updatedAt', 'updatedAt')
+      }
+      // v2：公差包络分析作业
+      if (!db.objectStoreNames.contains(TOL_STORE)) {
+        const tstore = db.createObjectStore(TOL_STORE, { keyPath: 'id' })
+        tstore.createIndex('updatedAt', 'updatedAt')
+        tstore.createIndex('fingerprint', 'fingerprint', { unique: false })
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -49,12 +58,12 @@ function openDb(): Promise<IDBDatabase> {
   return dbPromise
 }
 
-function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+export function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>, storeName = STORE): Promise<T> {
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const t = db.transaction(STORE, mode)
-        const req = fn(t.objectStore(STORE))
+        const t = db.transaction(storeName, mode)
+        const req = fn(t.objectStore(storeName))
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })

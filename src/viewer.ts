@@ -18,6 +18,19 @@ export interface ViewerOptions {
   contactRegions?: Pt[][][] // Clipper 干涉区域（世界坐标，按帧）
 }
 
+/** 公差包络分析：最坏样本的冻结几何预览（全部来自作业快照，单位 mm） */
+export interface TolerancePreview {
+  g1: GearGeometry
+  g2: GearGeometry
+  /** 该样本实际中心距 */
+  a: number
+  /** 最坏相位两轮转角 */
+  phi1: number
+  phi2: number
+  /** 最坏相位重叠区域（世界坐标） */
+  regions: Pt[][]
+}
+
 interface GearMesh {
   group: THREE.Group
   body: THREE.Mesh
@@ -37,6 +50,10 @@ export class GearViewer {
   private pitchPoint: THREE.Mesh | null = null
   private contactMarker: THREE.Mesh | null = null
   private interferenceGroup: THREE.Group
+  private toleranceGroup: THREE.Group
+  private toleranceWorstMarker: THREE.Mesh | null = null
+  /** 公差预览模式：动画循环不再驱动角度/覆盖物，直到退出 */
+  private toleranceMode = false
   private raycaster = new THREE.Raycaster()
   private container: HTMLElement
   private resizeObs: ResizeObserver
@@ -82,6 +99,9 @@ export class GearViewer {
 
     this.interferenceGroup = new THREE.Group()
     this.scene.add(this.interferenceGroup)
+
+    this.toleranceGroup = new THREE.Group()
+    this.scene.add(this.toleranceGroup)
 
     this.resizeObs = new ResizeObserver(() => this.resize())
     this.resizeObs.observe(container)
@@ -146,6 +166,11 @@ export class GearViewer {
   }
 
   setGears(g1: GearGeometry, g2: GearGeometry, centerDistance: number) {
+    if (this.toleranceMode) {
+      this.toleranceMode = false
+      this.clearTolerancePreview()
+    }
+    this.clearOverlay()
     if (this.gear1) this.scene.remove(this.gear1.group)
     if (this.gear2) this.scene.remove(this.gear2.group)
     this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
@@ -170,11 +195,13 @@ export class GearViewer {
   }
 
   setAngles(phi1: number, phi2: number) {
+    if (this.toleranceMode) return
     if (this.gear1) this.gear1.group.rotation.z = phi1
     if (this.gear2) this.gear2.group.rotation.z = phi2
   }
 
   setMeshOverlay(mesh: MeshInfo | null, opts: ViewerOptions) {
+    if (this.toleranceMode) return
     this.clearOverlay()
     if (!mesh || !this.gear1 || !this.gear2) return
 
@@ -299,6 +326,77 @@ export class GearViewer {
       const c = this.interferenceGroup.children.pop()!
       ;(c as THREE.Mesh).geometry?.dispose()
     }
+  }
+
+  /**
+   * 公差包络预览：用【作业快照内的冻结几何】替换当前场景中的两轮，
+   * 停在最坏相位并红色高亮重叠区、黄色球标记最坏位置。
+   * 与当前基准面板完全解耦——退出预览前不响应 setAngles 的动画驱动。
+   */
+  setTolerancePreview(p: TolerancePreview) {
+    this.clearTolerancePreview()
+    this.toleranceMode = true
+    this.clearOverlay()
+    if (this.gear1) this.scene.remove(this.gear1.group)
+    if (this.gear2) this.scene.remove(this.gear2.group)
+    this.gear1 = this.buildGearMesh(p.g1, 0x7e57c2)
+    this.gear2 = this.buildGearMesh(p.g2, 0x26a69a)
+    this.scene.add(this.gear1.group, this.gear2.group)
+    this.gear1.group.position.x = 0
+    this.gear2.group.position.x = p.a
+    this.gear1.group.rotation.z = p.phi1
+    this.gear2.group.rotation.z = p.phi2
+    this.targetCenter(p.a / 2, Math.max(p.g1.addendumR, p.g2.addendumR))
+
+    const bodyDepth = (m: THREE.Mesh) => {
+      m.geometry.computeBoundingBox()
+      return m.geometry.boundingBox ? m.geometry.boundingBox.max.z - m.geometry.boundingBox.min.z : 0
+    }
+    const z = Math.max(bodyDepth(this.gear1.body), bodyDepth(this.gear2.body)) / 2 + 2.2
+    for (const ring of p.regions) {
+      if (ring.length < 3) continue
+      const shape = new THREE.Shape()
+      shape.moveTo(ring[0].x, ring[0].y)
+      for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
+      shape.closePath()
+      const geo = new THREE.ShapeGeometry(shape)
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff2d55,
+        transparent: true,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+        depthTest: false
+      })
+      const m = new THREE.Mesh(geo, mat)
+      m.position.z = z
+      m.renderOrder = 999
+      this.toleranceGroup.add(m)
+    }
+    // 最坏位置标记：取所有重叠区域顶点的形心
+    const acc = { x: 0, y: 0, n: 0 }
+    for (const ring of p.regions)
+      for (const q of ring) {
+        acc.x += q.x
+        acc.y += q.y
+        acc.n++
+      }
+    if (acc.n) {
+      this.toleranceWorstMarker = new THREE.Mesh(
+        new THREE.SphereGeometry(1.1, 20, 20),
+        new THREE.MeshBasicMaterial({ color: 0xffd60a, depthTest: false })
+      )
+      this.toleranceWorstMarker.position.set(acc.x / acc.n, acc.y / acc.n, z + 0.5)
+      this.toleranceWorstMarker.renderOrder = 1000
+      this.toleranceGroup.add(this.toleranceWorstMarker)
+    }
+  }
+
+  clearTolerancePreview() {
+    while (this.toleranceGroup.children.length) {
+      const c = this.toleranceGroup.children.pop()!
+      ;(c as THREE.Mesh).geometry?.dispose()
+    }
+    this.toleranceWorstMarker = null
   }
 
   /** 返回世界坐标（用于拾取，本工具暂保留接口） */

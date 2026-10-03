@@ -32,6 +32,13 @@ export interface GearInput {
   alpha: number
   /** 齿宽 b，mm，仅用于 3D 挤出，不影响啮合几何 */
   faceWidth: number
+  /**
+   * 分度圆弧齿厚增量 Δs（mm），默认 0（公差包络分析用）。
+   * 实现方式：左右齿面整体各绕齿轮中心转动 τ = Δs/(2r)（连同根部圆角），
+   * 即分度圆弧齿厚由 πm/2 变为 πm/2+Δs；基圆、基节与模数不变，
+   * 因此仍是对"齿厚偏差"的教学近似，不涉及变位/齿廓修形。
+   */
+  toothThicknessOffset?: number
 }
 
 export interface GearGeometry {
@@ -156,23 +163,27 @@ function arcPoints(r: number, a0: number, a1: number, steps: number): Pt[] {
  */
 export function buildGear(input: GearInput, involuteSteps = 16): GearGeometry {
   const { z, module: m, alpha } = input
+  const ds = input.toothThicknessOffset ?? 0
   const r = (m * z) / 2
   const rb = r * Math.cos(alpha)
   const ra = r + TOOL.haStar * m
   const rf = r - (TOOL.haStar + TOOL.cStar) * m
   const p = Math.PI * m
   const pb = p * Math.cos(alpha)
-  const s = (Math.PI * m) / 2
+  const s = (Math.PI * m) / 2 + ds
   const pitch = (2 * Math.PI) / z
   const baseAboveRoot = rb > rf
 
   const invA = inv(alpha)
-  const beta = Math.PI / (2 * z) + invA
+  // 齿厚增量 Δs 对应单侧齿面整体转角 τ=Δs/(2r)：
+  // 右齿面向槽内、左齿面向槽外各转 τ，齿厚加宽、槽宽等量收窄（基圆不变）。
+  const tau = ds / (2 * r)
+  const beta = Math.PI / (2 * z) + invA + tau
 
   const taTip = tAtRadius(ra, rb)
   const alphaTip = Math.atan(taTip)
   const invTip = taTip - Math.atan(taTip) // inv(αa)
-  const tipHalfAngle = Math.PI / (2 * z) + invA - invTip
+  const tipHalfAngle = Math.PI / (2 * z) + invA + tau - invTip
   const tipThickness = 2 * ra * tipHalfAngle
   const pointed = tipHalfAngle <= 0
 

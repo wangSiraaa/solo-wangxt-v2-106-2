@@ -82,3 +82,56 @@ th { color: #9fb4cf; font-weight: 600; }
 .ca { display: flex; gap: 4px; align-items: center; }
 .ca button { flex: 0 0 auto; padding: 3px 8px; }
 .empty { color: #6b7686; justify-content: center !important; }
+
+/* ------- 公差包络分析 ------- */
+.tol-panel { border-bottom: 1px solid #222b36; padding-bottom: 12px; margin-bottom: 12px; }
+.tol-panel h2 { font-size: 13px; color: #9fb4cf; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+.disclaimer { font-size: 11px; color: #8b97a7; background: #0d1219; border-left: 3px solid #b08900; border-radius: 4px; padding: 6px 8px; margin: 0 0 8px; }
+.tol-disabled { font-size: 12px; color: #ff7a90; padding: 8px 0; }
+.grid-form { display: grid; grid-template-columns: 1fr 1fr 0.8fr; gap: 4px 8px; }
+.grid-form label { font-size: 11px; margin: 3px 0; }
+.grid-form .span2 { grid-column: 1 / -1; }
+.errlist { list-style: none; margin: 4px 0; padding: 0; color: #ff7a90; font-size: 11px; }
+.meta { font-size: 11px; color: #8b97a7; }
+
+.job { background: #0f141c; border: 1px solid #232d3a; border-radius: 8px; padding: 8px; margin: 8px 0; }
+.job.stale { border-color: #5c4a1f; background: #171408; }
+.job.active { border-color: #2b5ea8; }
+.job-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.status { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: #233040; color: #aab6c6; }
+.status.running { background: #1d3a5f; color: #9cc8ff; }
+.status.done { background: #173d2c; color: #3ddc91; }
+.status.cancelled { background: #3d2f17; color: #ffc466; }
+.stale-badge { font-size: 10px; background: #5c4a1f; color: #ffd98a; border-radius: 4px; padding: 1px 5px; }
+.job-sub { font-size: 10.5px; color: #8b97a7; margin-top: 3px; }
+.job-sub.warn { color: #ffc466; }
+
+.progress { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.progress .bar { flex: 1; height: 6px; background: #0a0e14; border-radius: 4px; overflow: hidden; }
+.progress .fill { height: 100%; background: linear-gradient(90deg, #2b5ea8, #4a86d8); transition: width .15s; }
+.progress span { font-size: 10.5px; color: #8b97a7; min-width: 46px; text-align: right; }
+
+.counts { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; margin: 4px 0; }
+.invalid-c { color: #ffc466; }
+.worst { color: #c9d4e2; }
+.link { flex: 0 0 auto; width: auto; padding: 1px 8px; font-size: 11px; margin-left: 4px; }
+
+.heat-scroll { overflow-x: auto; }
+.heatmap { display: grid; gap: 2px; margin: 6px 0 2px; min-width: 240px; }
+.rowlabel { font-size: 9px; color: #6b7686; text-align: right; padding-right: 4px; background: none; border: none; }
+.cell { height: 16px; border-radius: 3px; border: 1px solid #00000055; padding: 0; cursor: pointer; min-width: 14px; }
+.cell.safe { background: #2e8b57; }
+.cell.risk { background: #e23b54; }
+.cell.invalid { background: #b08900; }
+.cell.pending { background: #1c242e; }
+.cell.sel { outline: 2px solid #ffffff; outline-offset: 0; }
+.axis-note { font-size: 10px; color: #6b7686; }
+.sel-detail { font-size: 11px; background: #0c1118; border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+.cancel-note { font-size: 10.5px; color: #ffc466; }
+.exit-preview { background: #3a2e14; border-color: #6b5420; color: #ffd98a; }
+
+.tol-banner {
+  position: absolute; left: 12px; top: 12px; z-index: 20;
+  background: #2a2109cc; color: #ffd98a; border: 1px solid #6b5420;
+  font-size: 12px; padding: 6px 10px; border-radius: 6px; max-width: 60%;
+}
