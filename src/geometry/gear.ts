@@ -32,6 +32,13 @@ export interface GearInput {
   alpha: number
   /** 齿宽 b，mm，仅用于 3D 挤出，不影响啮合几何 */
   faceWidth: number
+  /**
+   * 分度圆弧齿厚偏差 Δs（mm），可选，默认 0（教学用齿厚公差）。
+   * 正值=齿加厚、负值=齿减薄；实现方式为两侧齿面绕齿轮中心整体平移 Δβ=Δs/(2r)
+   * （等价于无侧隙相位角变化的近似：齿距/基圆不变，仅齿槽与齿厚互换量变化）。
+   * 要求 |Δs| < πm/2（齿厚、槽宽均须为正）；极端情况下齿顶可变尖（pointed）。
+   */
+  thicknessDelta?: number
 }
 
 export interface GearGeometry {
@@ -52,7 +59,9 @@ export interface GearGeometry {
   basePitch: number
   /** 齿厚（分度圆弧长）s = πm/2 */
   toothThickness: number
-  /** 齿面构造旋转角 β = π/(2z)+invα */
+  /** 分度圆弧齿厚偏差 Δs（mm），0 为标准齿厚 */
+  thicknessDelta: number
+  /** 齿面构造旋转角 β = π/(2z) + invα + Δs/(2r) */
   beta: number
   /** 渐开线在齿顶圆的展开参数 ta = tan αa */
   taTip: number
@@ -156,23 +165,26 @@ function arcPoints(r: number, a0: number, a1: number, steps: number): Pt[] {
  */
 export function buildGear(input: GearInput, involuteSteps = 16): GearGeometry {
   const { z, module: m, alpha } = input
+  const thicknessDelta = input.thicknessDelta ?? 0
   const r = (m * z) / 2
   const rb = r * Math.cos(alpha)
   const ra = r + TOOL.haStar * m
   const rf = r - (TOOL.haStar + TOOL.cStar) * m
   const p = Math.PI * m
   const pb = p * Math.cos(alpha)
-  const s = (Math.PI * m) / 2
+  const s = (Math.PI * m) / 2 + thicknessDelta
   const pitch = (2 * Math.PI) / z
   const baseAboveRoot = rb > rf
 
   const invA = inv(alpha)
-  const beta = Math.PI / (2 * z) + invA
+  // 齿厚偏差：两侧齿面对称平移 Δβ = Δs/(2r)（弧齿厚变化量 = 2r·Δβ = Δs）
+  const beta = Math.PI / (2 * z) + invA + thicknessDelta / (2 * r)
 
   const taTip = tAtRadius(ra, rb)
   const alphaTip = Math.atan(taTip)
   const invTip = taTip - Math.atan(taTip) // inv(αa)
-  const tipHalfAngle = Math.PI / (2 * z) + invA - invTip
+  // 齿顶单侧半角 = β − inv(αa)；β 已含齿厚偏差平移项 Δs/(2r)
+  const tipHalfAngle = beta - invTip
   const tipThickness = 2 * ra * tipHalfAngle
   const pointed = tipHalfAngle <= 0
 
@@ -329,6 +341,7 @@ export function buildGear(input: GearInput, involuteSteps = 16): GearGeometry {
     circularPitch: p,
     basePitch: pb,
     toothThickness: s,
+    thicknessDelta,
     beta,
     taTip,
     zMinValue,
@@ -385,5 +398,10 @@ export function validateGearInput(i: GearInput): string[] {
   if (!(i.module > 0) || !Number.isFinite(i.module)) errs.push('模数必须 > 0')
   if (!(i.alpha > 0) || i.alpha >= Math.PI / 2) errs.push('压力角必须在 (0°, 90°) 内')
   if (!(i.faceWidth > 0)) errs.push('齿宽必须 > 0')
+  if (i.thicknessDelta !== undefined) {
+    const limit = (Math.PI * i.module) / 2
+    if (!Number.isFinite(i.thicknessDelta) || Math.abs(i.thicknessDelta) >= limit)
+      errs.push(`齿厚偏差 |Δs| 必须 < πm/2 = ${limit.toFixed(4)} mm（齿厚与槽宽均须为正）`)
+  }
   return errs
 }

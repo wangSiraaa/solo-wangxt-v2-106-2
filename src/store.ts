@@ -9,7 +9,10 @@ import type { GearInput, Pt } from './geometry/gear'
 
 export const SCHEMA_VERSION = 1
 export const DB_NAME = 'spur-gear-lab'
+export const DB_VERSION = 2
 export const STORE = 'cases'
+/** 公差包络分析作业对象仓库（keyPath='id'，按 snapshot.key 索引，见 envelope-store.ts） */
+export const ENVELOPE_STORE = 'envelopeJobs'
 
 export interface CaseData {
   schemaVersion: number
@@ -35,12 +38,18 @@ let dbPromise: Promise<IDBDatabase> | null = null
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: 'id' })
         store.createIndex('updatedAt', 'updatedAt')
+      }
+      // v2：公差包络分析作业
+      if (!db.objectStoreNames.contains(ENVELOPE_STORE)) {
+        const envStore = db.createObjectStore(ENVELOPE_STORE, { keyPath: 'id' })
+        envStore.createIndex('snapshotKey', 'snapshot.key', { unique: false })
+        envStore.createIndex('updatedAt', 'updatedAt')
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -49,32 +58,39 @@ function openDb(): Promise<IDBDatabase> {
   return dbPromise
 }
 
-function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
-  return openDb().then(
-    (db) =>
-      new Promise<T>((resolve, reject) => {
-        const t = db.transaction(STORE, mode)
-        const req = fn(t.objectStore(STORE))
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-  )
+/** 供其它存储模块（envelope-store）复用同一数据库连接 */
+export function getDatabase(): Promise<IDBDatabase> {
+  return openDb()
+}
+
+export async function withStore<T>(
+  mode: IDBTransactionMode,
+  storeName: string,
+  fn: (store: IDBObjectStore) => IDBRequest<T>
+): Promise<T> {
+  const db = await openDb()
+  return new Promise<T>((resolve, reject) => {
+    const t = db.transaction(storeName, mode)
+    const req = fn(t.objectStore(storeName))
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
 }
 
 export async function saveCase(data: CaseData): Promise<void> {
-  await tx('readwrite', (s) => s.put({ ...data, updatedAt: Date.now() }))
+  await withStore('readwrite', STORE, (s) => s.put({ ...data, updatedAt: Date.now() }))
 }
 
 export async function deleteCase(id: string): Promise<void> {
-  await tx('readwrite', (s) => s.delete(id))
+  await withStore('readwrite', STORE, (s) => s.delete(id))
 }
 
 export async function getCase(id: string): Promise<CaseData | undefined> {
-  return tx<CaseData | undefined>('readonly', (s) => s.get(id))
+  return withStore<CaseData | undefined>('readonly', STORE, (s) => s.get(id))
 }
 
 export async function listCases(): Promise<CaseData[]> {
-  const all = await tx<CaseData[]>('readonly', (s) => s.getAll() as IDBRequest<CaseData[]>)
+  const all = await withStore<CaseData[]>('readonly', STORE, (s) => s.getAll() as IDBRequest<CaseData[]>)
   return [...all].sort((a, b) => b.updatedAt - a.updatedAt)
 }
 

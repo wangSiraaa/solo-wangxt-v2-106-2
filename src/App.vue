@@ -3,6 +3,22 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
+import {
+  AREA_THRESHOLD,
+  MAX_AXIS_COUNT,
+  MAX_COMBOS,
+  MAX_PHASE_STEPS,
+  MIN_PHASE_STEPS,
+  buildComboGeometry,
+  makeSnapshot,
+  validateEnvelopeSpec,
+  type BaselineParams,
+  type EnvelopeJob,
+  type EnvelopeSpec,
+  type Verdict
+} from './geometry/envelope'
+import { EnvelopeRunner } from './geometry/envelope-store'
+import { idbJobStorage } from './geometry/envelope-idb'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
@@ -171,6 +187,9 @@ watch(
     contactS.value = 0
     interferenceArea.value = null
     interferenceRegions.value = []
+    // 基准参数改变：退出包络定位视图；旧作业保留、归属旧快照，不覆盖新面板
+    envelopeView.value = false
+    envelopePoseInfo.value = null
   }
 )
 
@@ -291,6 +310,234 @@ const dims = computed(() => {
   return { g1: g1.value, g2: g2.value, mesh: mesh.value }
 })
 
+// ===========================================================================
+// 公差包络分析（本机；理想刚性教学近似，不是制造认证）
+// ===========================================================================
+
+// 范围以 mm 内部存储；界面通过 computed 在显示单位间换算
+const envInputs = reactive({
+  daMin: -0.05,
+  daMax: 0.05,
+  daCount: 3,
+  ds1Min: -0.02,
+  ds1Max: 0.02,
+  ds1Count: 3,
+  ds2Min: -0.02,
+  ds2Max: 0.02,
+  ds2Count: 3,
+  phaseSteps: 24
+})
+
+const envelopeSpec = computed<EnvelopeSpec>(() => ({
+  center: { min: envInputs.daMin, max: envInputs.daMax, count: Math.round(envInputs.daCount) },
+  thickness1: { min: envInputs.ds1Min, max: envInputs.ds1Max, count: Math.round(envInputs.ds1Count) },
+  thickness2: { min: envInputs.ds2Min, max: envInputs.ds2Max, count: Math.round(envInputs.ds2Count) },
+  phaseSteps: Math.round(envInputs.phaseSteps)
+}))
+
+// 范围输入框按当前显示单位换算；写入立即转回 mm，内部尺寸与快照不受单位影响
+function mmField(get: () => number, set: (v: number) => void) {
+  return computed({ get: () => fromMm(get(), unit.value), set: (v: number) => set(toMm(v, unit.value)) })
+}
+const daMinU = mmField(() => envInputs.daMin, (v) => (envInputs.daMin = v))
+const daMaxU = mmField(() => envInputs.daMax, (v) => (envInputs.daMax = v))
+const ds1MinU = mmField(() => envInputs.ds1Min, (v) => (envInputs.ds1Min = v))
+const ds1MaxU = mmField(() => envInputs.ds1Max, (v) => (envInputs.ds1Max = v))
+const ds2MinU = mmField(() => envInputs.ds2Min, (v) => (envInputs.ds2Min = v))
+const ds2MaxU = mmField(() => envInputs.ds2Max, (v) => (envInputs.ds2Max = v))
+
+/** 当前基准参数（冻结快照用；内部恒 mm） */
+function currentBaseline(): BaselineParams | null {
+  if (!g1.value || !g2.value || !mesh.value) return null
+  return {
+    gear1: {
+      z: g1.value.input.z,
+      module: g1.value.input.module,
+      alpha: g1.value.input.alpha,
+      faceWidth: g1.value.input.faceWidth
+    },
+    gear2: {
+      z: g2.value.input.z,
+      module: g2.value.input.module,
+      alpha: g2.value.input.alpha,
+      faceWidth: g2.value.input.faceWidth
+    },
+    baseCenterDistance: mesh.value.a,
+    useStandardCenter: gearParams.useStandardCenter,
+    unit: unit.value
+  }
+}
+
+/** 当前面板基准指纹（单位不参与）；用于判断选中作业是否属于"这一代"参数 */
+const currentKey = computed(() => {
+  const b = currentBaseline()
+  if (!b) return ''
+  return makeSnapshot({ ...b, unit: 'mm' }, envelopeSpec.value, 0).key
+})
+
+const envSpecErrors = computed<string[]>(() => {
+  const b = currentBaseline()
+  if (!b) return ['基准齿轮参数无效']
+  return validateEnvelopeSpec(envelopeSpec.value, b.gear1, b.gear2, b.baseCenterDistance).errors
+})
+
+const envComboCount = computed(() => envInputs.daCount * envInputs.ds1Count * envInputs.ds2Count)
+
+// ------- 作业状态 -------
+const envRunner = new EnvelopeRunner(idbJobStorage())
+const envJobs = ref<EnvelopeJob[]>([])
+const selectedJobId = ref<string | null>(null)
+
+const selectedJob = computed<EnvelopeJob | null>(
+  () => envJobs.value.find((j) => j.id === selectedJobId.value) ?? null
+)
+const selectedExtrema = computed(() =>
+  selectedJob.value ? envRunner.extrema(selectedJob.value) : null
+)
+const selectedMatchesCurrent = computed(
+  () => !!selectedJob.value && selectedJob.value.snapshot.key === currentKey.value
+)
+
+async function refreshEnvJobs(keepSelection = true) {
+  envJobs.value = await idbJobStorage().getAll()
+  if (!keepSelection) selectedJobId.value = null
+  if (selectedJobId.value && !envJobs.value.some((j) => j.id === selectedJobId.value)) {
+    selectedJobId.value = null
+    exitEnvelopeView()
+  }
+}
+
+let envSubscribed = false
+onMounted(() => {
+  if (envSubscribed) return
+  envSubscribed = true
+  envRunner.subscribe(() => void refreshEnvJobs(true))
+  void (async () => {
+    await refreshEnvJobs(false)
+    // 刷新后恢复：只恢复 running 作业的未完成组合，已完成统计原样保留
+    await envRunner.resumeInterrupted()
+    await refreshEnvJobs(true)
+  })()
+})
+
+const envStarting = ref(false)
+
+async function startEnvelope() {
+  const b = currentBaseline()
+  if (!b || envStarting.value) return
+  envStarting.value = true
+  try {
+    const res = await envRunner.start(b, envelopeSpec.value)
+    if (!res.ok) {
+      alert('分析未启动（未写入任何结果）：\n' + res.errors.join('\n'))
+      return
+    }
+    selectedJobId.value = res.job.id
+    exitEnvelopeView()
+    await refreshEnvJobs(true)
+  } finally {
+    envStarting.value = false
+  }
+}
+
+async function cancelEnvelope() {
+  if (selectedJobId.value) await envRunner.cancel(selectedJobId.value)
+}
+async function resumeEnvelope() {
+  if (selectedJobId.value) await envRunner.resume(selectedJobId.value)
+}
+async function removeEnvelope() {
+  if (!selectedJobId.value) return
+  if (!confirm('删除该分析作业及其全部结果？')) return
+  const id = selectedJobId.value
+  selectedJobId.value = null
+  exitEnvelopeView()
+  await envRunner.remove(id)
+}
+async function recomputeCombo(index: number) {
+  if (selectedJobId.value) await envRunner.recompute(selectedJobId.value, [index])
+}
+async function recomputeAllRisk() {
+  if (!selectedJob.value) return
+  const idx = selectedJob.value.combos.filter((c) => c.status === 'risk').map((c) => c.index)
+  if (idx.length && selectedJobId.value) await envRunner.recompute(selectedJobId.value, idx)
+}
+
+function selectJob(id: string) {
+  selectedJobId.value = id
+  exitEnvelopeView()
+}
+
+// 结论表过滤
+const envFilter = ref<'all' | Verdict>('all')
+const filteredCombos = computed(() => {
+  const j = selectedJob.value
+  if (!j) return []
+  const list = envFilter.value === 'all' ? j.combos : j.combos.filter((c) => c.status === envFilter.value)
+  return [...list].sort((a, b) => b.maxArea - a.maxArea)
+})
+
+// ------- 风险组合在几何视图中定位（最坏相位 + 重叠多边形） -------
+const envelopeView = ref(false)
+const envelopePoseBusy = ref(false)
+const envelopePoseInfo = ref<{
+  da: number
+  ds1: number
+  ds2: number
+  a: number
+  s: number
+  area: number
+} | null>(null)
+
+async function locateCombo(index: number) {
+  if (!selectedJob.value) return
+  const combo = selectedJob.value.combos[index]
+  if (!combo || combo.status !== 'risk' || combo.worstPhi1 === null || combo.worstPhi2 === null) return
+  envelopePoseBusy.value = true
+  try {
+    const pose = await envRunner.getWorstPose(selectedJob.value.id, index)
+    if (!pose) return
+    const built = buildComboGeometry(
+      selectedJob.value.snapshot,
+      pose.combo.da,
+      pose.combo.ds1,
+      pose.combo.ds2
+    )
+    if (!built.ok) return
+    const { g1: gg1, g2: gg2, a } = built.geom
+    pause()
+    viewer?.setEnvelopeView(gg1, gg2, a, combo.worstPhi1, combo.worstPhi2, pose.regions)
+    envelopeView.value = true
+    envelopePoseInfo.value = {
+      da: pose.combo.da,
+      ds1: pose.combo.ds1,
+      ds2: pose.combo.ds2,
+      a,
+      s: pose.combo.worstS ?? 0,
+      area: pose.combo.maxArea
+    }
+  } finally {
+    envelopePoseBusy.value = false
+  }
+}
+
+function exitEnvelopeView() {
+  if (!envelopeView.value && !viewer?.isEnvelopeMode()) {
+    envelopePoseInfo.value = null
+    return
+  }
+  viewer?.clearEnvelopeView()
+  envelopeView.value = false
+  envelopePoseInfo.value = null
+  // 回到基准齿轮（当前面板参数）
+  if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+}
+
+function fmtTime(ts: number | null) {
+  if (!ts) return '—'
+  return new Date(ts).toLocaleTimeString()
+}
+
 /** 实际啮合线参数 s 的两端（用于接触点滑块） */
 const sBounds = computed<[number, number]>(() => {
   if (!mesh.value) return [-30, 30]
@@ -304,6 +551,11 @@ const sBounds = computed<[number, number]>(() => {
 
 function fmt(mm: number) {
   return fmtLen(mm, unit.value)
+}
+
+/** 冻结 mm 数值按当前显示单位格式化（不带单位后缀，表格用） */
+function fmtU(mm: number) {
+  return fromMm(mm, unit.value).toFixed(UNITS[unit.value].decimals)
 }
 
 // 预设样本：标准齿数与极少齿数，便于核对
@@ -387,6 +639,160 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
             <b :class="interferenceArea > 1e-6 ? 'bad' : 'good'">
               {{ interferenceArea > 1e-6 ? '存在实体干涉 ❗' : '当前帧无干涉 ✅' }}
             </b>
+          </div>
+        </section>
+
+        <section class="envelope">
+          <h2>公差包络分析 <span class="tag">教学近似</span></h2>
+          <p class="disclaimer">
+            在冻结的基准参数上扫描中心距偏差 Δa 与两轮齿厚偏差 Δs 的组合，逐组合在有效啮合区间内扫描相位，
+            复用当前渐开线齿廓与 Clipper 布尔求交判定。<b>仍是理想刚性、2D 端截面的教学近似</b>，
+            不含弹性、热膨胀、齿向/粗糙度误差与概率装配，<b>不能用于真实制造认证</b>。
+          </p>
+
+          <div class="axisgrid">
+            <div class="ax-head"><span>Δa 中心距偏差（{{ UNITS[unit].label }}）</span></div>
+            <label>下限<input type="number" v-model.number="daMinU" :step="UNITS[unit].step" /></label>
+            <label>上限<input type="number" v-model.number="daMaxU" :step="UNITS[unit].step" /></label>
+            <label>采样点<input type="number" v-model.number="envInputs.daCount" min="2" :max="MAX_AXIS_COUNT" step="1" /></label>
+
+            <div class="ax-head"><span>Δs₁ 轮1齿厚偏差（{{ UNITS[unit].label }}）</span></div>
+            <label>下限<input type="number" v-model.number="ds1MinU" :step="UNITS[unit].step" /></label>
+            <label>上限<input type="number" v-model.number="ds1MaxU" :step="UNITS[unit].step" /></label>
+            <label>采样点<input type="number" v-model.number="envInputs.ds1Count" min="2" :max="MAX_AXIS_COUNT" step="1" /></label>
+
+            <div class="ax-head"><span>Δs₂ 轮2齿厚偏差（{{ UNITS[unit].label }}）</span></div>
+            <label>下限<input type="number" v-model.number="ds2MinU" :step="UNITS[unit].step" /></label>
+            <label>上限<input type="number" v-model.number="ds2MaxU" :step="UNITS[unit].step" /></label>
+            <label>采样点<input type="number" v-model.number="envInputs.ds2Count" min="2" :max="MAX_AXIS_COUNT" step="1" /></label>
+          </div>
+
+          <label>每组合相位扫描点数（{{ MIN_PHASE_STEPS }}…{{ MAX_PHASE_STEPS }}，含啮合区间两端）
+            <input type="number" v-model.number="envInputs.phaseSteps" :min="MIN_PHASE_STEPS" :max="MAX_PHASE_STEPS" step="1" />
+          </label>
+          <div class="combo-count">
+            组合总数 <b :class="envComboCount > MAX_COMBOS ? 'bad' : ''">{{ envComboCount }}</b>
+            × {{ envInputs.phaseSteps }} 相位 = {{ envComboCount * envInputs.phaseSteps }} 次求交
+            （上限 {{ MAX_COMBOS }} 组合）
+          </div>
+          <ul v-if="envSpecErrors.length" class="warns">
+            <li v-for="(e, i) in envSpecErrors" :key="i">⛔ {{ e }}</li>
+          </ul>
+          <button class="wide" @click="startEnvelope" :disabled="envStarting || !!envSpecErrors.length">
+            {{ envStarting ? '创建中…' : '对当前冻结基准开始分析' }}
+          </button>
+
+          <!-- 作业世代选择器 -->
+          <div v-if="envJobs.length" class="job-picker">
+            <label>分析作业（含历史快照，按更新时间排序）
+              <select :value="selectedJobId ?? ''" @change="selectJob(($event.target as HTMLSelectElement).value)">
+                <option value="" disabled>— 选择作业 —</option>
+                <option v-for="j in envJobs" :key="j.id" :value="j.id">
+                  {{ j.snapshot.label }} · {{ j.status === 'done' ? '完成' : j.status === 'cancelled' ? '已取消' : '运行中' }}
+                  · {{ new Date(j.updatedAt).toLocaleTimeString() }}
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <!-- 选中作业面板 -->
+          <div v-if="selectedJob" class="job-panel">
+            <div v-if="!selectedMatchesCurrent" class="generation-warn">
+              ⚠️ 此作业属于<b>旧参数快照</b>（{{ selectedJob.snapshot.unit }} 单位下创建，数值以 mm 冻结）。
+              当前面板参数已改变，旧结果不会被覆盖，新分析将生成新一代作业。
+            </div>
+            <div class="snap">
+              <div>快照：{{ selectedJob.snapshot.label }}</div>
+              <div>基准中心距 a = {{ fmt(selectedJob.snapshot.baseCenterDistance) }}；Δa/Δs 均以 mm 冻结</div>
+              <div class="muted">
+                Δa [{{ fmtU(selectedJob.snapshot.spec.center.min) }}, {{ fmtU(selectedJob.snapshot.spec.center.max) }}] ·
+                Δs₁ [{{ fmtU(selectedJob.snapshot.spec.thickness1.min) }},
+                {{ fmtU(selectedJob.snapshot.spec.thickness1.max) }}] ·
+                Δs₂ [{{ fmtU(selectedJob.snapshot.spec.thickness2.min) }}, {{ fmtU(selectedJob.snapshot.spec.thickness2.max) }}]
+                {{ UNITS[unit].label }}（内部冻结为 mm）；
+                {{ selectedJob.combos.length }} 组合 × {{ selectedJob.snapshot.spec.phaseSteps }} 相位
+              </div>
+            </div>
+
+            <div class="progress">
+              <div class="bar">
+                <i class="safe" :style="{ width: ((selectedExtrema!.safe / selectedJob.combos.length) * 100) + '%' }"></i>
+                <i class="risk" :style="{ width: ((selectedExtrema!.risk / selectedJob.combos.length) * 100) + '%' }"></i>
+                <i class="invalid" :style="{ width: ((selectedExtrema!.invalid / selectedJob.combos.length) * 100) + '%' }"></i>
+              </div>
+              <div>
+                进度 {{ selectedExtrema!.safe + selectedExtrema!.risk + selectedExtrema!.invalid }}/{{ selectedJob.combos.length }}
+                （<span class="good">安全 {{ selectedExtrema!.safe }}</span> ·
+                <span class="bad">风险 {{ selectedExtrema!.risk }}</span> ·
+                <span class="warn">无效 {{ selectedExtrema!.invalid }}</span> ·
+                待算 {{ selectedExtrema!.pending }}）
+              </div>
+            </div>
+
+            <div class="extrema">
+              已完成最大重叠面积：
+              <b :class="selectedExtrema!.maxArea > AREA_THRESHOLD ? 'bad' : 'good'">
+                {{ selectedExtrema!.maxArea.toExponential(3) }} mm²
+              </b>
+              <span v-if="selectedExtrema!.worstComboIndex >= 0">
+                <button class="mini" @click="locateCombo(selectedExtrema!.worstComboIndex)">在 3D 中定位最坏位置 (#{{ selectedExtrema!.worstComboIndex }})</button>
+              </span>
+            </div>
+
+            <div class="row">
+              <button v-if="selectedJob.status === 'running'" @click="cancelEnvelope" :disabled="!envRunner.isActive(selectedJob.id) && !envRunner.isBusy(selectedJob.id)">取消</button>
+              <button v-if="selectedJob.status === 'cancelled' || selectedExtrema!.pending > 0" @click="resumeEnvelope" :disabled="envRunner.isBusy(selectedJob.id)">继续/恢复</button>
+              <button @click="recomputeAllRisk" :disabled="envRunner.isBusy(selectedJob.id) || selectedExtrema!.risk === 0">重算全部风险</button>
+              <button class="del" @click="removeEnvelope">删除作业</button>
+            </div>
+            <div class="muted">创建 {{ fmtTime(selectedJob.createdAt) }} · 更新 {{ fmtTime(selectedJob.updatedAt) }} · 完成 {{ fmtTime(selectedJob.finishedAt) }}</div>
+
+            <!-- 包络定位信息条 -->
+            <div v-if="envelopePoseInfo" class="pose-box">
+              <div>最坏位置（已冻结到 3D 视图）：Δa={{ fmtU(envelopePoseInfo.da) }},
+                Δs₁={{ fmtU(envelopePoseInfo.ds1) }}, Δs₂={{ fmtU(envelopePoseInfo.ds2) }} {{ UNITS[unit].label }}</div>
+              <div>实际中心距 a={{ fmt(envelopePoseInfo.a) }}；啮合线参数 s={{ fmt(envelopePoseInfo.s) }}；
+                重叠面积 <b class="bad">{{ envelopePoseInfo.area.toExponential(3) }} mm²</b></div>
+              <button class="mini" @click="exitEnvelopeView">退出定位视图</button>
+              <span v-if="envelopePoseBusy" class="muted">求交中…</span>
+            </div>
+
+            <!-- 结论表 -->
+            <div class="filter-row">
+              <span>结论筛选：</span>
+              <button v-for="f in ['all', 'risk', 'safe', 'invalid'] as const" :key="f"
+                      :class="{ active: envFilter === f }" @click="envFilter = f">
+                {{ { all: '全部', risk: '风险', safe: '安全', invalid: '无效' }[f] }}
+              </button>
+            </div>
+            <div class="combo-table">
+              <table>
+                <thead>
+                  <tr><th>#</th><th>Δa ({{ UNITS[unit].label }})</th><th>Δs₁</th><th>Δs₂</th><th>结论</th><th>最大面积 mm²</th><th>最坏 s mm</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in filteredCombos.slice(0, 120)" :key="c.index" :class="'v-' + c.status">
+                    <td>{{ c.index }}</td>
+                    <td>{{ fmtU(c.da) }}</td>
+                    <td>{{ fmtU(c.ds1) }}</td>
+                    <td>{{ fmtU(c.ds2) }}</td>
+                    <td>
+                      <b :class="c.status === 'risk' ? 'bad' : c.status === 'safe' ? 'good' : 'warn'">
+                        {{ c.status === 'risk' ? '风险' : c.status === 'safe' ? '安全' : c.status === 'invalid' ? '无效' : '待算' }}
+                      </b>
+                      <div v-if="c.reason" class="reason" :title="c.reason">原因：{{ c.reason }}</div>
+                    </td>
+                    <td>{{ c.status === 'pending' ? '—' : c.maxArea.toExponential(2) }}</td>
+                    <td>{{ c.worstS === null ? '—' : c.worstS.toFixed(3) }}</td>
+                    <td>
+                      <button v-if="c.status === 'risk'" class="mini" @click="locateCombo(c.index)">定位</button>
+                      <button class="mini" @click="recomputeCombo(c.index)" :disabled="envRunner.isBusy(selectedJob.id)" title="仅重算此组合">↻</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-if="filteredCombos.length > 120" class="muted">仅显示前 120 行（共 {{ filteredCombos.length }}），可用筛选缩小范围。</div>
+            </div>
           </div>
         </section>
 

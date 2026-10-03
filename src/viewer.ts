@@ -37,6 +37,11 @@ export class GearViewer {
   private pitchPoint: THREE.Mesh | null = null
   private contactMarker: THREE.Mesh | null = null
   private interferenceGroup: THREE.Group
+  /**
+   * 包络分析定位模式：为 true 时实时动画循环不得覆盖转角/参考圆/干涉区，
+   * 由公差包络面板把视图冻结在某个风险组合的最坏相位。
+   */
+  private envelopeMode = false
   private raycaster = new THREE.Raycaster()
   private container: HTMLElement
   private resizeObs: ResizeObserver
@@ -145,7 +150,9 @@ export class GearViewer {
     return { group, body, refs }
   }
 
+  /** 切换为指定基准齿轮（包络分析的快照齿轮；会退出包络定位模式） */
   setGears(g1: GearGeometry, g2: GearGeometry, centerDistance: number) {
+    this.clearEnvelopeView()
     if (this.gear1) this.scene.remove(this.gear1.group)
     if (this.gear2) this.scene.remove(this.gear2.group)
     this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
@@ -170,11 +177,14 @@ export class GearViewer {
   }
 
   setAngles(phi1: number, phi2: number) {
+    if (this.envelopeMode) return
     if (this.gear1) this.gear1.group.rotation.z = phi1
     if (this.gear2) this.gear2.group.rotation.z = phi2
   }
 
   setMeshOverlay(mesh: MeshInfo | null, opts: ViewerOptions) {
+    // 包络定位模式：视图冻结在风险组合最坏相位，实时动画的覆盖请求一律忽略
+    if (this.envelopeMode) return
     this.clearOverlay()
     if (!mesh || !this.gear1 || !this.gear2) return
 
@@ -253,27 +263,90 @@ export class GearViewer {
 
     if (opts.contactRegions) {
       for (const regionSet of opts.contactRegions) {
-        for (const ring of regionSet) {
-          if (ring.length < 3) continue
-          const shape = new THREE.Shape()
-          shape.moveTo(ring[0].x, ring[0].y)
-          for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
-          shape.closePath()
-          const geo = new THREE.ShapeGeometry(shape)
-          const mat = new THREE.MeshBasicMaterial({
-            color: 0xff2d55,
-            transparent: true,
-            opacity: 0.5,
-            side: THREE.DoubleSide,
-            depthTest: false
-          })
-          const m = new THREE.Mesh(geo, mat)
-          m.position.z = Math.max(g1Depth, g2Depth) / 2 + 2
-          m.renderOrder = 999
-          this.interferenceGroup.add(m)
-        }
+        this.addRegionMeshes(regionSet)
       }
     }
+  }
+
+  private bodyDepth(m: THREE.Mesh): number {
+    m.geometry.computeBoundingBox()
+    const bb = m.geometry.boundingBox
+    return bb ? bb.max.z - bb.min.z : 0
+  }
+
+  /** 在前端面之上叠加布尔重叠多边形（红色半透明，关闭深度测试） */
+  addRegionMeshes(rings: Pt[][]) {
+    if (!this.gear1 || !this.gear2) return
+    const z = Math.max(this.bodyDepth(this.gear1.body), this.bodyDepth(this.gear2.body)) / 2 + 2
+    for (const ring of rings) {
+      if (ring.length < 3) continue
+      const shape = new THREE.Shape()
+      shape.moveTo(ring[0].x, ring[0].y)
+      for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
+      shape.closePath()
+      const geo = new THREE.ShapeGeometry(shape)
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff2d55,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        depthTest: false
+      })
+      const m = new THREE.Mesh(geo, mat)
+      m.position.z = z
+      m.renderOrder = 999
+      this.interferenceGroup.add(m)
+    }
+  }
+
+  /** 清除叠加的干涉区域（不动其它覆盖物） */
+  clearRegionMeshes() {
+    while (this.interferenceGroup.children.length) {
+      const c = this.interferenceGroup.children.pop()!
+      ;(c as THREE.Mesh).geometry?.dispose()
+    }
+  }
+
+  isEnvelopeMode(): boolean {
+    return this.envelopeMode
+  }
+
+  /**
+   * 进入包络定位模式：重建为该组合的齿厚齿轮，摆放到实际中心距，
+   * 转到最坏相位并显示 Clipper 重叠区域；实时动画暂停且不再覆盖视图。
+   */
+  setEnvelopeView(
+    g1: GearGeometry,
+    g2: GearGeometry,
+    centerDistance: number,
+    phi1: number,
+    phi2: number,
+    regions: Pt[][],
+    showRefCircles = true
+  ) {
+    this.envelopeMode = true
+    this.clearOverlay()
+    if (this.gear1) this.scene.remove(this.gear1.group)
+    if (this.gear2) this.scene.remove(this.gear2.group)
+    this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
+    this.gear2 = this.buildGearMesh(g2, 0xffb86e)
+    this.scene.add(this.gear1.group, this.gear2.group)
+    this.gear2.group.position.x = centerDistance
+    this.gear1.group.rotation.z = phi1
+    this.gear2.group.rotation.z = phi2
+    for (const key of ['pitch', 'base', 'addendum', 'dedendum'] as const) {
+      this.gear1.refs[key].visible = showRefCircles && (key === 'pitch' || key === 'addendum')
+      this.gear2.refs[key].visible = showRefCircles && (key === 'pitch' || key === 'addendum')
+    }
+    this.addRegionMeshes(regions)
+    this.targetCenter(centerDistance / 2, Math.max(g1.addendumR, g2.addendumR))
+  }
+
+  /** 退出包络定位模式并清掉其重叠区；实时动画随后恢复覆盖视图 */
+  clearEnvelopeView() {
+    if (!this.envelopeMode && !this.interferenceGroup.children.length) return
+    this.envelopeMode = false
+    this.clearRegionMeshes()
   }
 
   private clearOverlay() {
